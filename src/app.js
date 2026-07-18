@@ -1,26 +1,38 @@
 const express = require("express");
 const cors = require("cors");
-
+const mongoose = require("mongoose");
+const authRoutes = require("./routes/authRoutes");
 const app = express();
 
 const spaceModel = require("./models/space.models");
 const journalModel = require("./models/journal.models");
-const Chat = require("./models/chats.models"); // IMPORTANT
+const Chat = require("./models/chats.models");
 const geminiService = require("./services/gemini.services");
 
 app.use(cors());
 app.use(express.json());
 
-/* -------------------- SPACES -------------------- */
+app.use("/api/auth", authRoutes);
+
+/* -------------------- SPACES --------------------
+   NOTE: these routes (and /journal, /chats below) currently trust
+   whatever userId the client sends, with no auth check. Anyone who
+   knows or guesses a userId can read or write that user's data.
+   Recommend adding a verifyToken middleware here (checking whatever
+   your login flow issues) and deriving userId from the verified
+   token instead of req.query/req.body.
+------------------------------------------------- */
 
 app.post("/spaces", async (req, res) => {
   try {
     const space = await spaceModel.create(req.body);
 
-    res.status(201).json({
-      space,
-      message: "Space created successfully",
-    });
+    // Return the space directly — CreateSpace.tsx reads dbSpace._id
+    // off the top-level response, so wrapping it in { message, space }
+    // meant that id was always undefined and every new space fell
+    // back to a fake local id, showing up twice once the real one
+    // synced from the DB.
+    res.status(201).json(space);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -28,7 +40,16 @@ app.post("/spaces", async (req, res) => {
 
 app.get("/spaces", async (req, res) => {
   try {
-    const spaces = await spaceModel.find();
+    const { userId } = req.query;
+
+    // Without this check, a missing/undefined userId means Mongo/Mongoose
+    // just drops the key from the filter and find({ userId }) becomes
+    // find({}) — silently returning every user's spaces instead of none.
+    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ error: "A valid userId is required" });
+    }
+
+    const spaces = await spaceModel.find({ userId });
 
     res.json({ spaces });
   } catch (err) {
@@ -50,7 +71,15 @@ app.post("/journal", async (req, res) => {
 
 app.get("/journal", async (req, res) => {
   try {
-    const journal = await journalModel.find();
+    const { userId } = req.query;
+
+    // Same issue as /spaces: an unfiltered/undefined userId would
+    // otherwise silently return every user's journal entries.
+    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ error: "A valid userId is required" });
+    }
+
+    const journal = await journalModel.find({ userId });
 
     res.json({ journal });
   } catch (err) {
@@ -60,9 +89,6 @@ app.get("/journal", async (req, res) => {
 
 /* -------------------- CHAT SYSTEM -------------------- */
 
-/**
- * Create a new chat inside a space
- */
 app.post("/chats", async (req, res) => {
   try {
     const { spaceId } = req.body;
@@ -79,12 +105,11 @@ app.post("/chats", async (req, res) => {
   }
 });
 
-/**
- * Get all chats for a space
- */
 app.get("/chats/:spaceId", async (req, res) => {
   try {
-    const chats = await Chat.find({ spaceId: req.params.spaceId });
+    const chats = await Chat.find({
+      spaceId: req.params.spaceId,
+    });
 
     res.json({ chats });
   } catch (err) {
@@ -92,9 +117,6 @@ app.get("/chats/:spaceId", async (req, res) => {
   }
 });
 
-/**
- * Get single chat
- */
 app.get("/chat/:chatId", async (req, res) => {
   try {
     const chat = await Chat.findById(req.params.chatId);
@@ -105,29 +127,26 @@ app.get("/chat/:chatId", async (req, res) => {
   }
 });
 
-/**
- * MAIN: send message + AI reply + store both
- */
 app.post("/chats/:chatId/message", async (req, res) => {
   try {
     const { message } = req.body;
     const { chatId } = req.params;
 
     const chat = await Chat.findById(chatId);
+
     if (!chat) {
-      return res.status(404).json({ error: "Chat not found" });
+      return res.status(404).json({
+        error: "Chat not found",
+      });
     }
 
-    // 🧠 Get spaceId BEFORE modifying
     const spaceId = chat.spaceId;
 
-    // user message
     chat.messages.push({
       role: "user",
       content: message,
     });
 
-    // AI reply
     const reply = await geminiService.chat(message);
 
     chat.messages.push({
@@ -137,18 +156,16 @@ app.post("/chats/:chatId/message", async (req, res) => {
 
     await chat.save();
 
-    // 🔥 INCREMENT MESSAGE COUNT (2 messages added)
     await spaceModel.findByIdAndUpdate(spaceId, {
       $inc: { msgs: 2 },
-    
     });
+
     res.json({
       reply,
       chat,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
-  
   }
 });
 
